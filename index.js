@@ -4,7 +4,7 @@ const { v4: uuidv4 } = require("uuid");
 const path = require("path");
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 const { PubSub } = require("@google-cloud/pubsub");
 const pubsub = new PubSub();
@@ -42,11 +42,26 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
-const upload = multer({ storage, fileFilter });
+const upload = multer({ 
+  storage, 
+  fileFilter,
+  limits: {
+    fileSize: 10 * 1024 * 1024  // 10MB max
+  }
+});
 
-// Root
+// Root route
 app.get("/", (req, res) => {
   res.send("🚀 Data Processing API is running");
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    timestamp: new Date(),
+    uptime: process.uptime()
+  });
 });
 
 // 🔥 UPLOAD API
@@ -70,21 +85,22 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     console.log("✅ Job Created:", jobId);
 
-    // ✅ SEND TO PUB/SUB (REPLACEMENT FOR setTimeout)
- 
- 
-    try {
-    await pubsub.topic(TOPIC_NAME).publishMessage({
-      json: {
-        jobId,
-        fileName: req.file.filename,
-        filePath: req.file.path
-      }
-    });
-    } catch (err) {
-      console.error("❌ PubSub error:", err.message);
+    // ✅ Check if topic exists before publishing
+    const topic = pubsub.topic(TOPIC_NAME);
+    const [exists] = await topic.exists();
+    
+    if (!exists) {
+      console.error(`❌ Topic "${TOPIC_NAME}" does not exist!`);
+    } else {
+      await topic.publishMessage({
+        json: {
+          jobId,
+          fileName: req.file.filename,
+          filePath: req.file.path
+        }
+      });
+      console.log("📤 Job sent to queue:", jobId);
     }
-    console.log("📤 Job sent to queue:", jobId);
     
     res.status(200).json({
       message: "File uploaded successfully",
@@ -147,7 +163,35 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message });
 });
 
+// ✅ GRACEFUL SHUTDOWN for INDEX.JS
+let server;
+
+async function gracefulShutdown() {
+  console.log("\n🛑 Shutting down server...");
+  
+  if (server) {
+    server.close(async () => {
+      console.log("✅ HTTP server closed");
+      
+      try {
+        // Close Firestore
+        await db.terminate();
+        console.log("💾 Firestore connection closed");
+      } catch (err) {
+        console.error("Error closing Firestore:", err.message);
+      }
+      
+      process.exit(0);
+    });
+  } else {
+    process.exit(0);
+  }
+}
+
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
+
 // Start server
-app.listen(PORT, () => {
+server = app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
