@@ -3,9 +3,26 @@ const admin = require("firebase-admin");
 const fs = require("fs");
 const csv = require("csv-parser");
 const pdfParse = require("pdf-parse");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { logger, createJobLogger, measureAsync } = require("./logger");
+const https = require('https');
+const http = require('http');
+const Brevo = require('@getbrevo/brevo');
+require("dotenv").config();
+
+// ============================================
+// CONFIGURATION
+// ============================================
+const MAX_RETRIES = parseInt(process.env.MAX_RETRIES) || 3;
+const RETRY_DELAYS = [1000, 5000, 15000]; // 1s, 5s, 15s backoff
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE) || 10 * 1024 * 1024; // 10MB
 
 // Set your project ID
 process.env.GOOGLE_CLOUD_PROJECT = "smpi-3f14b";
+
+// Initialize Gemini AI
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const aiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 const serviceAccount = require("./serviceAccountKey.json");
 
@@ -21,402 +38,662 @@ const pubsub = new PubSub({
   credentials: serviceAccount
 });
 
-// Use your exact subscription name
 const subscriptionName = "file-processing-sub";
 const subscription = pubsub.subscription(subscriptionName);
 
-// Helper function to safely acknowledge messages
-async function safeAck(message, jobId, filePath, fileName) {
+// ============================================
+// WEBHOOK NOTIFICATION
+// ============================================
+async function sendWebhook(jobId, result, webhookUrl, status = "completed") {
+  if (!webhookUrl) return;
+  
   try {
-    message.ack();
-    console.log(`✅ Acknowledged: ${jobId}`);
+    const url = new URL(webhookUrl);
+    const client = url.protocol === 'https:' ? https : http;
     
-    // Clean up file if not already deleted
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      console.log(`🗑️ Cleaned up: ${fileName}`);
-    }
+    const payload = JSON.stringify({
+      event: `job.${status}`,
+      jobId: jobId,
+      status: status,
+      result: result,
+      timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV || "development"
+    });
+    
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      },
+      timeout: 5000
+    };
+    
+    return new Promise((resolve) => {
+      const req = client.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          logger.info("Webhook sent", { jobId, statusCode: res.statusCode, webhookUrl });
+          resolve({ success: res.statusCode >= 200 && res.statusCode < 300 });
+        });
+      });
+      
+      req.on('error', (err) => {
+        logger.error("Webhook failed", { jobId, error: err.message, webhookUrl });
+        resolve({ success: false, error: err.message });
+      });
+      
+      req.on('timeout', () => {
+        req.destroy();
+        logger.error("Webhook timeout", { jobId, webhookUrl });
+        resolve({ success: false, error: "Timeout" });
+      });
+      
+      req.write(payload);
+      req.end();
+    });
   } catch (err) {
-    console.error(`Failed to ack ${jobId}:`, err.message);
+    logger.error("Webhook error", { jobId, error: err.message });
+    return { success: false, error: err.message };
   }
 }
 
-// Listen for messages with TIMEOUT HANDLING
+// ============================================
+// EMAIL ALERTS
+// ============================================
+let brevoApiInstance = null;
+
+function getBrevoClient() {
+  if (!brevoApiInstance && process.env.BREVO_API_KEY) {
+    brevoApiInstance = new Brevo.TransactionalEmailsApi();
+    brevoApiInstance.setApiKey(Brevo.TransactionalEmailsApiApiKeys.apiKey, process.env.BREVO_API_KEY);
+  }
+  return brevoApiInstance;
+}
+
+async function sendFailureAlert(jobId, fileName, error, batchId = null) {
+  const apiInstance = getBrevoClient();
+  if (!apiInstance) {
+    logger.warn("Brevo not configured, skipping email alert", { jobId });
+    return;
+  }
+  
+  try {
+    const sendSmtpEmail = new Brevo.SendSmtpEmail();
+    sendSmtpEmail.subject = `❌ Job Failed: ${jobId.substring(0, 8)}`;
+    sendSmtpEmail.to = [{ email: process.env.ALERT_EMAIL }];
+    sendSmtpEmail.htmlContent = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <style>
+          body { font-family: Arial, sans-serif; }
+          .container { padding: 20px; max-width: 600px; margin: 0 auto; }
+          .header { background: #dc3545; color: white; padding: 10px; text-align: center; }
+          .content { border: 1px solid #ddd; padding: 20px; }
+          .label { font-weight: bold; color: #333; }
+          .error { background: #f8d7da; padding: 10px; border-left: 4px solid #dc3545; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h2>⚠️ Document Processing Failed</h2>
+          </div>
+          <div class="content">
+            <p><span class="label">Job ID:</span> ${jobId}</p>
+            <p><span class="label">File Name:</span> ${fileName}</p>
+            ${batchId ? `<p><span class="label">Batch ID:</span> ${batchId}</p>` : ''}
+            <p><span class="label">Time:</span> ${new Date().toISOString()}</p>
+            <div class="error">
+              <p><span class="label">Error:</span></p>
+              <p>${error}</p>
+            </div>
+            <p><small>This is an automated alert from your Document Processing System.</small></p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    sendSmtpEmail.sender = { 
+      email: "alerts@document-processor.com", 
+      name: "Document Processor System" 
+    };
+    
+    await apiInstance.sendTransacEmail(sendSmtpEmail);
+    logger.info("Email alert sent", { jobId });
+  } catch (err) {
+    logger.error("Email alert failed", { jobId, error: err.message });
+  }
+}
+
+// ============================================
+// GEMINI AI PARSING FUNCTION (Enhanced)
+// ============================================
+async function parseWithGemini(text, fileName, retryCount = 0) {
+  const limitedText = text.substring(0, 15000);
+  
+  const prompt = `You are a document analyzer. Analyze this document and return ONLY valid JSON (no other text).
+
+Document filename: ${fileName}
+Document content: ${limitedText}
+
+Extract and return this exact JSON structure:
+{
+  "documentType": "one of: Resume, Invoice, Report, Contract, Letter, Scientific Paper, Legal Document, Financial, Educational, Other",
+  "confidence": "high/medium/low",
+  "keyInformation": {
+    "name": "person name if found",
+    "email": "email if found",
+    "phone": "phone number if found",
+    "organization": "company/organization name if found",
+    "date": "important date if found"
+  },
+  "summary": "one sentence summary of the document (max 150 chars)",
+  "mainSections": ["section1", "section2", "section3"],
+  "keyTopics": ["topic1", "topic2", "topic3", "topic4", "topic5"],
+  "sentiment": "positive/negative/neutral"
+}
+
+Return ONLY the JSON. No explanations, no markdown.`;
+  
+  try {
+    const result = await aiModel.generateContent(prompt);
+    const responseText = result.response.text();
+    
+    let cleanJson = responseText;
+    if (cleanJson.includes("```json")) {
+      cleanJson = cleanJson.split("```json")[1].split("```")[0];
+    } else if (cleanJson.includes("```")) {
+      cleanJson = cleanJson.split("```")[1].split("```")[0];
+    }
+    
+    return JSON.parse(cleanJson);
+  } catch (err) {
+    if (retryCount < MAX_RETRIES) {
+      const delay = RETRY_DELAYS[retryCount];
+      logger.warn("Gemini parsing failed, retrying", { 
+        error: err.message, 
+        fileName, 
+        retry: retryCount + 1,
+        delayMs: delay 
+      });
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return parseWithGemini(text, fileName, retryCount + 1);
+    }
+    
+    logger.error("Gemini parsing error after retries", { error: err.message, fileName });
+    return {
+      documentType: "Unknown",
+      confidence: "low",
+      keyInformation: {},
+      summary: text.substring(0, 150),
+      mainSections: [],
+      keyTopics: [],
+      sentiment: "neutral"
+    };
+  }
+}
+
+// ============================================
+// ENHANCED BASIC FALLBACK PARSING
+// ============================================
+function basicParse(text, fileName) {
+  const cleanText = text.replace(/\s+/g, ' ').trim();
+  const wordCount = cleanText.split(/\s+/).length;
+  
+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const urlRegex = /https?:\/\/[^\s]+/g;
+  const phoneRegex = /(\+\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}/g;
+  const nameRegex = /(?:name|full name)[:\s]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/i;
+  const orgRegex = /(?:company|organization|university)[:\s]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/i;
+  
+  const emails = cleanText.match(emailRegex) || [];
+  const urls = cleanText.match(urlRegex) || [];
+  const phones = cleanText.match(phoneRegex) || [];
+  const nameMatch = cleanText.match(nameRegex);
+  const orgMatch = cleanText.match(orgRegex);
+  
+  let detectedType = "Unknown";
+  const textLower = cleanText.toLowerCase();
+  if (textLower.includes("resume") || textLower.includes("cv") || textLower.includes("curriculum vitae")) {
+    detectedType = "Resume";
+  } else if (textLower.includes("invoice") || textLower.includes("bill")) {
+    detectedType = "Invoice";
+  } else if (textLower.includes("report")) {
+    detectedType = "Report";
+  } else if (textLower.includes("contract") || textLower.includes("agreement")) {
+    detectedType = "Contract";
+  }
+  
+  return {
+    documentType: detectedType,
+    confidence: "low",
+    keyInformation: {
+      name: nameMatch ? nameMatch[1] : null,
+      email: emails[0] || null,
+      phone: phones[0] || null,
+      organization: orgMatch ? orgMatch[1] : null,
+      url: urls[0] || null
+    },
+    summary: cleanText.substring(0, 200),
+    mainSections: [],
+    keyTopics: [],
+    sentiment: "neutral",
+    wordCount: wordCount,
+    emails: emails.slice(0, 5),
+    urls: urls.slice(0, 5),
+    phones: phones.slice(0, 3)
+  };
+}
+
+// ============================================
+// FILE VALIDATION
+// ============================================
+function validateFile(filePath, fileName) {
+  const stats = fs.statSync(filePath);
+  if (stats.size > MAX_FILE_SIZE) {
+    throw new Error(`File size (${stats.size} bytes) exceeds limit (${MAX_FILE_SIZE} bytes)`);
+  }
+  
+  const ext = fileName.split('.').pop().toLowerCase();
+  if (!['pdf', 'csv'].includes(ext)) {
+    throw new Error(`Unsupported file type: ${ext}`);
+  }
+  
+  try {
+    fs.accessSync(filePath, fs.constants.R_OK);
+  } catch (err) {
+    throw new Error(`File not readable: ${err.message}`);
+  }
+  
+  return true;
+}
+
+// Helper function for safe acknowledgment
+async function safeAck(message, jobId, filePath, fileName, jobLogger) {
+  try {
+    message.ack();
+    jobLogger.info("Message acknowledged", { jobId });
+    
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      jobLogger.info("File cleaned up", { fileName });
+    }
+  } catch (err) {
+    jobLogger.error("Failed to acknowledge", { error: err.message });
+  }
+}
+
+// ============================================
+// PROCESSING WITH RETRY LOGIC & PROGRESS
+// ============================================
+async function processWithRetry(jobId, filePath, fileName, jobLogger, retryCount = 0, jobData = {}) {
+  try {
+    validateFile(filePath, fileName);
+    
+    // CSV Processing with Progress Tracking
+    if (fileName.endsWith(".csv")) {
+      jobLogger.info("Starting CSV processing");
+      
+      // First pass: count total rows
+      let totalRows = 0;
+      await new Promise((resolve) => {
+        fs.createReadStream(filePath)
+          .pipe(csv())
+          .on("data", () => totalRows++)
+          .on("end", resolve);
+      });
+      
+      await db.collection("jobs").doc(jobId).update({
+        progress: 5,
+        statusMessage: `Found ${totalRows} rows to process`
+      });
+      
+      return await new Promise((resolve, reject) => {
+        let rowCount = 0;
+        let columns = [];
+        let sampleRows = [];
+        let processedRows = 0;
+        let lastProgressUpdate = 0;
+
+        fs.createReadStream(filePath)
+          .pipe(csv())
+          .on("headers", (headers) => {
+            columns = headers;
+            jobLogger.debug("CSV headers detected", { columnCount: headers.length });
+          })
+          .on("data", async (row) => {
+            rowCount++;
+            processedRows++;
+            if (sampleRows.length < 5) {
+              sampleRows.push(row);
+            }
+            
+            // Update progress every 10%
+            const percent = Math.floor((processedRows / totalRows) * 100);
+            if (percent >= lastProgressUpdate + 10 && percent > 0) {
+              lastProgressUpdate = percent;
+              await db.collection("jobs").doc(jobId).update({
+                progress: Math.min(percent, 95),
+                statusMessage: `Processing row ${processedRows}/${totalRows} (${percent}%)`
+              }).catch(() => {});
+            }
+          })
+          .on("end", () => {
+            resolve({
+              type: "CSV",
+              fileName: fileName,
+              rowCount: rowCount,
+              columns: columns,
+              sampleRows: sampleRows,
+              summary: `CSV file with ${rowCount} rows and ${columns.length} columns`
+            });
+          })
+          .on("error", reject);
+      });
+    }
+    
+    // PDF Processing with Gemini AI & Progress Tracking
+    else if (fileName.endsWith(".pdf")) {
+      jobLogger.info("Starting PDF processing with Gemini AI");
+      
+      await db.collection("jobs").doc(jobId).update({
+        progress: 10,
+        statusMessage: "Reading PDF file..."
+      });
+      
+      const buffer = fs.readFileSync(filePath);
+      
+      await db.collection("jobs").doc(jobId).update({
+        progress: 30,
+        statusMessage: "Extracting text from PDF..."
+      });
+      
+      const pdfData = await pdfParse(buffer);
+      const rawText = pdfData.text;
+      
+      if (rawText.length < 10) {
+        throw new Error("PDF contains no extractable text");
+      }
+      
+      await db.collection("jobs").doc(jobId).update({
+        progress: 50,
+        statusMessage: "Analyzing document with AI..."
+      });
+      
+      let aiResult;
+      let useFallback = false;
+      
+      try {
+        aiResult = await parseWithGemini(rawText, fileName);
+        jobLogger.info("Gemini AI parsing successful", { 
+          documentType: aiResult.documentType,
+          confidence: aiResult.confidence 
+        });
+      } catch (aiError) {
+        jobLogger.warn("Gemini failed, using fallback", { error: aiError.message });
+        useFallback = true;
+        aiResult = basicParse(rawText, fileName);
+      }
+      
+      await db.collection("jobs").doc(jobId).update({
+        progress: 80,
+        statusMessage: "Preparing results..."
+      });
+      
+      const cleanText = rawText.replace(/\s+/g, ' ').trim();
+      const wordCount = cleanText.split(/\s+/).length;
+      
+      const result = {
+        type: "PDF",
+        fileName: fileName,
+        pageCount: pdfData.numpages,
+        wordCount: wordCount,
+        characterCount: rawText.length,
+        parsedWith: useFallback ? "fallback" : "gemini-ai",
+        documentType: aiResult.documentType || "Unknown",
+        confidence: aiResult.confidence || "low",
+        summary: aiResult.summary || cleanText.substring(0, 200),
+        mainSections: aiResult.mainSections || [],
+        keyTopics: aiResult.keyTopics || [],
+        sentiment: aiResult.sentiment || "neutral",
+        keyInformation: aiResult.keyInformation || {},
+        preview: cleanText.substring(0, 500),
+        metadata: {
+          author: pdfData.info?.Author || "Unknown",
+          creator: pdfData.info?.Creator || "Unknown",
+          producer: pdfData.info?.Producer || "Unknown",
+          creationDate: pdfData.info?.CreationDate || "Unknown"
+        },
+        ...(useFallback && aiResult.emails && { extractedEmails: aiResult.emails }),
+        ...(useFallback && aiResult.urls && { extractedUrls: aiResult.urls })
+      };
+      
+      return result;
+    }
+    
+    throw new Error(`Unsupported file type: ${fileName}`);
+    
+  } catch (err) {
+    if (retryCount < MAX_RETRIES) {
+      const delay = RETRY_DELAYS[retryCount];
+      jobLogger.warn(`Processing failed, retrying (${retryCount + 1}/${MAX_RETRIES})`, { 
+        error: err.message,
+        delayMs: delay 
+      });
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return processWithRetry(jobId, filePath, fileName, jobLogger, retryCount + 1, jobData);
+    }
+    throw err;
+  }
+}
+
+// ============================================
+// MAIN MESSAGE HANDLER
+// ============================================
 subscription.on("message", async (message) => {
   const data = JSON.parse(message.data.toString());
-  const { jobId, filePath, fileName } = data;
+  const { jobId, filePath, fileName, batchId, webhookUrl } = data;
+  
+  // Fetch job data from Firestore to get webhookUrl and other fields
+  const jobDoc = await db.collection("jobs").doc(jobId).get();
+  const jobData = jobDoc.exists ? jobDoc.data() : { webhookUrl };
+  
+  const jobLogger = createJobLogger(jobId);
+  jobLogger.info("Job received", { fileName, filePath, batchId: batchId || "none" });
 
-  console.log("📥 Received job:", jobId);
-
-  // ✅ Add timeout (5 minutes max processing time)
   const timeoutId = setTimeout(async () => {
-    console.error(`⏰ Timeout for job: ${jobId}`);
+    jobLogger.error("Job timeout", { timeout: "5 minutes" });
     await db.collection("jobs").doc(jobId).update({
       status: "failed",
+      failedAt: new Date(),
+      progress: 0,
+      statusMessage: "Processing timeout",
       result: { error: "Processing timeout (5 minutes)" }
     });
     message.ack();
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     
-    // Cleanup file
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      console.log(`🗑️ Cleaned up timeout file: ${fileName}`);
+    // Send failure webhook
+    if (jobData.webhookUrl) {
+      await sendWebhook(jobId, { error: "Processing timeout" }, jobData.webhookUrl, "failed");
     }
-  }, 5 * 60 * 1000);  // 5 minutes
+  }, 5 * 60 * 1000);
 
   try {
     await db.collection("jobs").doc(jobId).update({
-      status: "processing"
+      status: "processing",
+      processingStartedAt: new Date(),
+      progress: 0,
+      statusMessage: "Starting processing...",
+      ...(batchId && { batchId })
     });
+    jobLogger.info("Status updated to processing");
 
-    // CSV Processing with safe ack
-    if (fileName.endsWith(".csv")) {
-      let rowCount = 0;
-      let columns = [];
-      let processed = false;
-
-      const stream = fs.createReadStream(filePath)
-        .pipe(csv())
-        .on("headers", (headers) => {
-          columns = headers;
-        })
-        .on("data", () => rowCount++)
-        .on("end", async () => {
-          if (processed) return;
-          processed = true;
-          
-          await db.collection("jobs").doc(jobId).update({
-            status: "completed",
-            result: { type: "CSV", rowCount, columns }
-          });
-          console.log("✅ CSV done:", jobId);
-          
-          clearTimeout(timeoutId);
-          await safeAck(message, jobId, filePath, fileName);
-        })
-        .on("error", async (err) => {
-          if (processed) return;
-          processed = true;
-          
-          await db.collection("jobs").doc(jobId).update({
-            status: "failed",
-            result: { error: err.message }
-          });
-          console.error("❌ CSV error:", err);
-          clearTimeout(timeoutId);
-          await safeAck(message, jobId, filePath, fileName);
-        });
-    }
-    // PDF Processing with ULTIMATE extraction
-    else if (fileName.endsWith(".pdf")) {
-      const buffer = fs.readFileSync(filePath);
-      const data = await pdfParse(buffer);
-      
-      // ============================================
-      // 1. TEXT CLEANING & NORMALIZATION
-      // ============================================
-      const rawText = data.text;
-      
-      // Remove excessive whitespace
-      const cleanText = rawText
-        .replace(/\r\n/g, '\n')
-        .replace(/\s+/g, ' ')
-        .replace(/\n\s+\n/g, '\n\n')
-        .replace(/[^\x20-\x7E\n]/g, '')
-        .trim();
-      
-      // Preserve paragraph structure
-      const paragraphs = rawText
-        .split(/\n\s*\n/)
-        .map(p => p.replace(/\s+/g, ' ').trim())
-        .filter(p => p.length > 50);
-      
-      const wordCount = cleanText.split(/\s+/).filter(w => w.length > 0).length;
-      const sentenceCount = cleanText.split(/[.!?]+/).filter(s => s.trim().length > 0).length;
-      
-      // ============================================
-      // 2. COMPLETE METADATA EXTRACTION
-      // ============================================
-      const metadata = {
-        title: data.info?.Title || "Untitled",
-        author: data.info?.Author || "Unknown Author",
-        subject: data.info?.Subject || "No subject",
-        keywords: data.info?.Keywords || "None",
-        creator: data.info?.Creator || "Unknown",
-        producer: data.info?.Producer || "Unknown",
-        creationDate: data.info?.CreationDate || "Unknown",
-        modificationDate: data.info?.ModDate || "Unknown",
-        trapped: data.info?.Trapped || "Unknown",
-        encrypted: data.info?.Encrypted || false
-      };
-      
-      // Parse dates if present
-      const parseDate = (dateStr) => {
-        if (dateStr === "Unknown") return null;
-        try {
-          const match = dateStr.match(/D:(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
-          if (match) {
-            return new Date(Date.UTC(match[1], match[2]-1, match[3], match[4], match[5], match[6]));
-          }
-          return null;
-        } catch {
-          return null;
-        }
-      };
-      
-      metadata.parsedCreationDate = parseDate(metadata.creationDate);
-      metadata.parsedModificationDate = parseDate(metadata.modificationDate);
-      
-      // ============================================
-      // 3. INTELLIGENT DOCUMENT CLASSIFICATION
-      // ============================================
-      const textLower = cleanText.toLowerCase();
-      
-      const documentTypes = {
-        "Resume/CV": ["resume", "cv", "curriculum vitae", "work experience", "education", "skills"],
-        "Invoice": ["invoice", "bill", "payment due", "amount due", "total"],
-        "Report": ["report", "analysis", "findings", "conclusion", "recommendation"],
-        "Contract": ["contract", "agreement", "terms", "conditions", "parties"],
-        "Letter": ["dear", "sincerely", "regards", "letter"],
-        "Scientific Paper": ["abstract", "introduction", "methodology", "results", "conclusion", "references"],
-        "Legal Document": ["whereas", "hereinafter", "witnesseth", "affidavit"],
-        "Financial": ["balance sheet", "income statement", "profit", "loss", "revenue"],
-        "Educational": ["syllabus", "course", "assignment", "homework", "exam"]
-      };
-      
-      let documentType = "General Document";
-      let confidence = 0;
-      
-      for (const [type, keywords] of Object.entries(documentTypes)) {
-        let score = 0;
-        for (const keyword of keywords) {
-          if (textLower.includes(keyword)) {
-            score += 1;
-          }
-        }
-        if (score > confidence) {
-          confidence = score;
-          documentType = type;
-        }
-      }
-      
-      // ============================================
-      // 4. KEY PHRASE & ENTITY EXTRACTION
-      // ============================================
-      const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-      const emails = [...new Set(cleanText.match(emailRegex) || [])];
-      
-      const urlRegex = /https?:\/\/[^\s]+/g;
-      const urls = [...new Set(cleanText.match(urlRegex) || [])];
-      
-      const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}/g;
-      const phones = [...new Set(cleanText.match(phoneRegex) || [])];
-      
-      const dateRegex = /\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}\b/gi;
-      const dates = [...new Set(cleanText.match(dateRegex) || [])].slice(0, 10);
-      
-      const currencyRegex = /\$\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?\s?(?:USD|EUR|GBP)/g;
-      const currencies = [...new Set(cleanText.match(currencyRegex) || [])];
-      
-      const percentageRegex = /\d+(?:\.\d+)?%/g;
-      const percentages = [...new Set(cleanText.match(percentageRegex) || [])];
-      
-      // ============================================
-      // 5. SECTION DETECTION & EXTRACTION
-      // ============================================
-      const sections = {};
-      const sectionPatterns = {
-        summary: /(?:summary|profile|objective|about me)[:\s]*([^\n]+(?:\n[^\n]+){0,5})/i,
-        education: /(?:education|academic|qualifications)[:\s]*([^\n]+(?:\n[^\n]+){0,10})/i,
-        experience: /(?:experience|employment|work history|professional)[:\s]*([^\n]+(?:\n[^\n]+){0,15})/i,
-        skills: /(?:skills|competencies|technologies|expertise)[:\s]*([^\n]+(?:\n[^\n]+){0,10})/i,
-        certifications: /(?:certifications|certificates|licenses)[:\s]*([^\n]+(?:\n[^\n]+){0,10})/i,
-        projects: /(?:projects|portfolio)[:\s]*([^\n]+(?:\n[^\n]+){0,15})/i,
-        languages: /(?:languages|language proficiency)[:\s]*([^\n]+(?:\n[^\n]+){0,5})/i,
-        references: /(?:references|referees)[:\s]*([^\n]+(?:\n[^\n]+){0,10})/i
-      };
-      
-      for (const [section, pattern] of Object.entries(sectionPatterns)) {
-        const match = rawText.match(pattern);
-        if (match) {
-          sections[section] = match[1].replace(/\s+/g, ' ').trim().substring(0, 300);
-        }
-      }
-      
-      // ============================================
-      // 6. TEXT STATISTICS
-      // ============================================
-      const statistics = {
-        wordCount: wordCount,
-        characterCount: rawText.length,
-        characterCountNoSpaces: rawText.replace(/\s/g, '').length,
-        sentenceCount: sentenceCount,
-        paragraphCount: paragraphs.length,
-        averageWordLength: (rawText.replace(/\s/g, '').length / wordCount).toFixed(1),
-        averageWordsPerSentence: (wordCount / sentenceCount).toFixed(1),
-        estimatedReadingTimeMinutes: Math.ceil(wordCount / 200),
-        uniqueWordCount: new Set(cleanText.toLowerCase().split(/\s+/)).size
-      };
-      
-      // ============================================
-      // 7. FREQUENT WORDS & KEYWORDS
-      // ============================================
-      const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'but', 'so', 'if', 'then', 'else', 'when', 'where', 'which', 'while', 'this', 'that', 'these', 'those', 'from', 'as', 'about', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'over', 'more', 'most', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'than', 'that', 'then', 'thence', 'there', 'these', 'they', 'this', 'those', 'through', 'throughout', 'thru', 'until', 'up', 'upon', 'with', 'within', 'without']);
-      
-      const words = cleanText.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !stopWords.has(w));
-      const wordFrequency = {};
-      for (const word of words) {
-        wordFrequency[word] = (wordFrequency[word] || 0) + 1;
-      }
-      
-      const topKeywords = Object.entries(wordFrequency)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 10)
-        .map(([word, count]) => ({ word, count }));
-      
-      // ============================================
-      // 8. LANGUAGE DETECTION
-      // ============================================
-      const detectLanguage = (text) => {
-        const langPatterns = {
-          english: /\b(the|and|of|to|in|for|is|on|that|by|this|with|are|from|was|at|be|have|has)\b/gi,
-          spanish: /\b(el|la|de|y|que|en|un|se|por|con|no|una|para|los|del)\b/gi,
-          french: /\b(le|la|de|et|les|des|un|une|est|pour|par|que|en|dans)\b/gi,
-          german: /\b(der|die|und|den|des|mit|von|sie|das|ist|nicht|auf|für|sich|dem)\b/gi
-        };
-        
-        let bestLang = "english";
-        let maxMatches = 0;
-        
-        for (const [lang, pattern] of Object.entries(langPatterns)) {
-          const matches = text.match(pattern) || [];
-          if (matches.length > maxMatches) {
-            maxMatches = matches.length;
-            bestLang = lang;
-          }
-        }
-        
-        return bestLang;
-      };
-      
-      const detectedLanguage = detectLanguage(cleanText);
-      
-      // ============================================
-      // 9. FORMAT EXTRACTION
-      // ============================================
-      const hasBulletPoints = /[•·*\-]\s/.test(rawText);
-      const hasNumberedList = /\d+\.\s/.test(rawText);
-      const hasTables = /[+-]+\+/.test(rawText) || /\|\s*.+\s*\|/.test(rawText);
-      const hasImages = /\.(jpg|jpeg|png|gif|bmp)/i.test(rawText);
-      
-      // ============================================
-      // 10. FINAL RESULT ASSEMBLY
-      // ============================================
-      const firstLines = cleanText.split('\n').slice(0, 5).join(' ').substring(0, 250);
-      const preview = cleanText.substring(0, 800);
-      
-      await db.collection("jobs").doc(jobId).update({
-        status: "completed",
-        result: {
-          type: "PDF",
-          fileName: fileName,
-          pageCount: data.numpages,
-          statistics: statistics,
-          documentType: documentType,
-          documentTypeConfidence: confidence,
-          detectedLanguage: detectedLanguage,
-          entities: {
-            emails: emails.slice(0, 5),
-            urls: urls.slice(0, 5),
-            phones: phones.slice(0, 5),
-            dates: dates,
-            currencies: currencies.slice(0, 5),
-            percentages: percentages.slice(0, 5)
-          },
-          sections: sections,
-          topKeywords: topKeywords,
-          format: {
-            hasBulletPoints: hasBulletPoints,
-            hasNumberedList: hasNumberedList,
-            hasTables: hasTables,
-            hasImages: hasImages
-          },
-          metadata: metadata,
-          summary: firstLines,
-          preview: preview,
-          firstParagraph: paragraphs[0] || ""
-        }
-      });
-      
-      console.log(`✅ PDF processed: ${fileName} | ${wordCount} words | ${data.numpages} pages | Type: ${documentType}`);
-      
-      clearTimeout(timeoutId);
-      
-      // Delete the file
-      try {
-        fs.unlinkSync(filePath);
-        console.log(`🗑️ Deleted: ${fileName}`);
-      } catch (err) {
-        console.error(`Failed to delete ${fileName}:`, err.message);
-      }
-      
-      message.ack();
-    }
-  } catch (err) {
-    clearTimeout(timeoutId);
+    const startTime = Date.now();
+    const result = await processWithRetry(jobId, filePath, fileName, jobLogger, 0, jobData);
+    const processingTime = Date.now() - startTime;
+    
+    result.processingTimeMs = processingTime;
     
     await db.collection("jobs").doc(jobId).update({
-      status: "failed",
-      result: { error: err.message }
+      status: "completed",
+      completedAt: new Date(),
+      progress: 100,
+      statusMessage: "Processing complete",
+      result: result
     });
-    console.error("❌ Worker error:", err);
     
-    // Delete file even on failure
-    try {
-      if (filePath && fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-        console.log(`🗑️ Deleted failed file: ${fileName}`);
-      }
-    } catch (cleanupErr) {
-      console.error("Cleanup error:", cleanupErr.message);
+    jobLogger.info("Processing complete", { 
+      documentType: result.documentType || result.type,
+      processingTimeMs: processingTime,
+      ...(result.wordCount && { wordCount: result.wordCount })
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      jobLogger.debug("File deleted", { fileName });
     }
     
     message.ack();
+    jobLogger.info("Message acknowledged");
+    
+    // Send success webhook
+    if (jobData.webhookUrl) {
+      await sendWebhook(jobId, result, jobData.webhookUrl, "completed");
+    }
+    
+  } catch (err) {
+    clearTimeout(timeoutId);
+    jobLogger.error("Worker error", { error: err.message, stack: err.stack });
+    
+    await db.collection("jobs").doc(jobId).update({
+      status: "failed",
+      failedAt: new Date(),
+      progress: 0,
+      statusMessage: `Failed: ${err.message.substring(0, 100)}`,
+      result: { 
+        error: err.message,
+        processingAttempts: MAX_RETRIES
+      }
+    });
+    
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      jobLogger.debug("Failed file cleaned up", { fileName });
+    }
+    message.ack();
+    
+    // Send failure webhook
+    if (jobData.webhookUrl) {
+      await sendWebhook(jobId, { error: err.message }, jobData.webhookUrl, "failed");
+    }
+    
+    // Send email alert
+    await sendFailureAlert(jobId, fileName, err.message, batchId);
   }
 });
 
 subscription.on("error", (error) => {
-  console.error("❌ Subscription error:", error);
+  logger.error("Subscription error", { error: error.message });
 });
 
-// ✅ GRACEFUL SHUTDOWN for WORKER.JS
+// ============================================
+// HEALTH CHECK FOR WORKER
+// ============================================
+const express = require("express");
+const healthApp = express();
+const HEALTH_PORT = parseInt(process.env.WORKER_HEALTH_PORT) || 3002;
+
+healthApp.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    service: "worker",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    config: {
+      maxRetries: MAX_RETRIES,
+      maxFileSize: MAX_FILE_SIZE,
+      geminiEnabled: true
+    }
+  });
+});
+
+healthApp.get("/ready", (req, res) => {
+  res.json({ ready: true });
+});
+
+healthApp.listen(HEALTH_PORT, () => {
+  logger.info("Worker health server started", { port: HEALTH_PORT });
+});
+
+// ============================================
+// GRACEFUL SHUTDOWN
+// ============================================
 let isShuttingDown = false;
 
 async function gracefulShutdown() {
   if (isShuttingDown) return;
   isShuttingDown = true;
   
-  console.log("\n🛑 Received shutdown signal. Closing gracefully...");
+  logger.info("Received shutdown signal, closing gracefully...");
   
   try {
     await subscription.close();
-    console.log("📡 Subscription closed");
+    logger.info("Subscription closed");
   } catch (err) {
-    console.error("Error closing subscription:", err.message);
+    logger.error("Error closing subscription", { error: err.message });
   }
   
   try {
     await db.terminate();
-    console.log("💾 Firestore connection closed");
+    logger.info("Firestore connection closed");
   } catch (err) {
-    console.error("Error closing Firestore:", err.message);
+    logger.error("Error closing Firestore", { error: err.message });
   }
   
-  console.log("✅ Graceful shutdown complete");
+  logger.info("Graceful shutdown complete");
   process.exit(0);
 }
 
 process.on("SIGINT", gracefulShutdown);
 process.on("SIGTERM", gracefulShutdown);
 
-console.log("🚀 Worker listening on subscription: file-processing-sub");
+// ============================================
+// STARTUP
+// ============================================
+logger.info("Worker started", { 
+  subscription: subscriptionName,
+  geminiEnabled: true,
+  projectId: "smpi-3f14b",
+  maxRetries: MAX_RETRIES,
+  maxFileSize: MAX_FILE_SIZE,
+  healthPort: HEALTH_PORT,
+  brevoEnabled: !!process.env.BREVO_API_KEY,
+  webhookEnabled: true
+});
+
+console.log(`
+╔══════════════════════════════════════════════════════════════════════════╗
+║     🤖 WORKER IS RUNNING (FULLY UPGRADED)                                ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║  Subscription:   ${subscriptionName.padEnd(40)}║
+║  Gemini AI:      Enabled${" ".padEnd(33)}║
+║  Max Retries:    ${String(MAX_RETRIES).padEnd(40)}║
+║  Max File Size:  ${String(MAX_FILE_SIZE / (1024 * 1024)).padEnd(40)}MB║
+║  Logging:        Winston (logs/ folder)${" ".padEnd(18)}║
+║  Health Port:    ${String(HEALTH_PORT).padEnd(40)}║
+║  Email Alerts:   ${process.env.BREVO_API_KEY ? "Enabled".padEnd(40) : "Disabled (no API key)".padEnd(40)}║
+║  Webhooks:       Enabled${" ".padEnd(33)}║
+╠══════════════════════════════════════════════════════════════════════════╣
+║  Health Check:   http://localhost:${HEALTH_PORT}/health                          ║
+║  Readiness:      http://localhost:${HEALTH_PORT}/ready                            ║
+╚══════════════════════════════════════════════════════════════════════════╝
+`);
